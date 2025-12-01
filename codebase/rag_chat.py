@@ -158,7 +158,7 @@ def ask(query):
     print(f"Initial pool: {len(initial_chunks)} chunks")
     print(f"After filtering: {len(filtered_chunks)} chunks")
     if low_confidence:
-        print("⚠ Low confidence match")
+        print("Low confidence match")
     print("------------------------")
 
     # 4. Format context text and display retrieved chunks
@@ -208,10 +208,10 @@ When you reference information from the context, cite it using the chunk number 
 #user input loop
 if __name__ == "__main__":
     print("RAG Chatbot Ready! Ask something about your documents.")
-    print("Type 'exit' or 'quit' to exit.\n")
+    print("Type 'q' to exit.\n")
     while True:
         q = input("Ask: ")
-        if q.lower() in ("exit", "quit", "q"):
+        if q.lower() in ("q"):
             print("Goodbye!")
             break
         print("\n" + ask(q))

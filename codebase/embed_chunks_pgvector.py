@@ -15,7 +15,7 @@ load_dotenv()
 # ----------------------------
 openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-PDF_PATH = "data/14_Paging.pdf"
+PDF_PATH = os.getenv("PDF_PATH")
 BATCH_SIZE = 2048  # OpenAI allows up to 2048 embeddings per request
 
 
