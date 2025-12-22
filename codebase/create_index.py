@@ -49,6 +49,7 @@ cur.execute("""
         id SERIAL PRIMARY KEY,
         user_id INT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         chunk TEXT,
+        header TEXT,
         embedding vector(1536),
         source TEXT,
         chunk_index INT
