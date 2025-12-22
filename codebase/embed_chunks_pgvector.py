@@ -5,6 +5,7 @@ from openai import OpenAI
 from dotenv import load_dotenv
 from chunk_pdf import chunk_pdf
 from semantic_chunker import chunk_semantically_from_pdf
+import cache_manager
 import time
 
 # ----------------------------
@@ -64,26 +65,50 @@ def get_or_create_demo_user():
 
 
 # ----------------------------
-# Batch embed using OpenAI API
+# Batch embed using OpenAI API (with caching)
 # ----------------------------
 def embed_batch(texts):
-    """Embed a batch of texts using OpenAI API (max 2048 per call)"""
+    """Embed a batch of texts using OpenAI API with caching (max 2048 per call)"""
     all_embeddings = []
+    texts_to_embed = []
+    text_indices = []  # Track which indices need embedding
 
-    for i in range(0, len(texts), BATCH_SIZE):
-        batch = texts[i:i+BATCH_SIZE]
-        print(f"Embedding batch {i//BATCH_SIZE + 1}/{(len(texts)-1)//BATCH_SIZE + 1} ({len(batch)} chunks)...")
+    # Check cache for each text
+    for i, text in enumerate(texts):
+        cached = cache_manager.get_cached_embedding(text)
+        if cached is not None:
+            all_embeddings.append((i, cached))
+        else:
+            texts_to_embed.append(text)
+            text_indices.append(i)
 
-        response = openai_client.embeddings.create(
-            model="text-embedding-3-small",
-            input=batch
-        )
+    cache_hits = len(texts) - len(texts_to_embed)
+    if cache_hits > 0:
+        print(f"Cache hits: {cache_hits}/{len(texts)} embeddings")
 
-        # Extract embeddings in order
-        embeddings = [item.embedding for item in response.data]
-        all_embeddings.extend(embeddings)
+    # Embed uncached texts
+    if texts_to_embed:
+        new_embeddings = []
+        for i in range(0, len(texts_to_embed), BATCH_SIZE):
+            batch = texts_to_embed[i:i+BATCH_SIZE]
+            print(f"Embedding batch {i//BATCH_SIZE + 1}/{(len(texts_to_embed)-1)//BATCH_SIZE + 1} ({len(batch)} chunks)...")
 
-    return all_embeddings
+            response = openai_client.embeddings.create(
+                model="text-embedding-3-small",
+                input=batch
+            )
+
+            embeddings = [item.embedding for item in response.data]
+            new_embeddings.extend(embeddings)
+
+        # Cache new embeddings and add to results
+        for idx, (text, embedding) in enumerate(zip(texts_to_embed, new_embeddings)):
+            cache_manager.cache_embedding(text, embedding)
+            all_embeddings.append((text_indices[idx], embedding))
+
+    # Sort by original index and extract just embeddings
+    all_embeddings.sort(key=lambda x: x[0])
+    return [emb for _, emb in all_embeddings]
 
 
 # ----------------------------
@@ -148,6 +173,13 @@ if __name__ == "__main__":
     # Get or create demo user for CLI usage
     demo_user_id = get_or_create_demo_user()
     print(f"Using demo user (id={demo_user_id})")
+
+    # Check for --nocache flag
+    if "--nocache" in sys.argv:
+        cache_manager.set_cache_enabled(False)
+        print("Cache disabled")
+    else:
+        print(f"Cache enabled at {cache_manager.CACHE_DIR}")
 
     # Check for --semantic flag
     use_semantic = "--semantic" in sys.argv
