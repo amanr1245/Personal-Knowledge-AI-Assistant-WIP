@@ -3,6 +3,7 @@ import pdfplumber
 import re
 from dotenv import load_dotenv
 from ocr_processor import process_pdf_with_ocr_combined, OcrStrategy
+import cache_manager
 
 load_dotenv()
 
@@ -33,6 +34,13 @@ def chunk_pdf(path, max_len=500, overlap=100, use_ocr=False, ocr_strategy=OcrStr
     # Clean up whitespace
     text = re.sub(r"\s+", " ", text).strip()
 
+    # Check cache for chunks (by document text hash + params)
+    cache_content = f"{text}|{max_len}|{overlap}"
+    cached_chunks = cache_manager.get_cached_chunks(cache_content)
+    if cached_chunks is not None:
+        print(f"Cache hit: {len(cached_chunks)} chunks from cache")
+        return cached_chunks
+
     # Split into sentences (break on . ! ?)
     sentences = re.split(r'(?<=[.!?])\s+', text)
 
@@ -52,6 +60,9 @@ def chunk_pdf(path, max_len=500, overlap=100, use_ocr=False, ocr_strategy=OcrStr
     # Don't forget the last chunk
     if current_chunk.strip():
         chunks.append(current_chunk.strip())
+
+    # Cache the result
+    cache_manager.cache_chunks(cache_content, chunks)
 
     return chunks
 
