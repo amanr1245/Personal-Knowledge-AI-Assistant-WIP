@@ -17,6 +17,7 @@ from dotenv import load_dotenv
 import fitz  # PyMuPDF
 import pdfplumber
 from openai import OpenAI
+import cache_manager
 
 load_dotenv()
 
@@ -103,13 +104,25 @@ def resolve_ocr_strategy(page_text: str, threshold: int = 50) -> OcrStrategy:
 def _process_page_strict(pdf_doc: fitz.Document, page_num: int) -> str:
     """
     STRICT mode: Render full page at 150 DPI and extract text via Vision API.
+    Results are cached by page image hash.
     """
     page = pdf_doc[page_num]
     image_bytes = _render_page_to_image(page, dpi=150)
-    image_base64 = _image_to_base64(image_bytes)
 
+    # Check cache first
+    cached_text = cache_manager.get_cached_ocr(image_bytes)
+    if cached_text is not None:
+        print(f"(cached)", end=" ")
+        return cached_text
+
+    image_base64 = _image_to_base64(image_bytes)
     prompt = "Extract all text from this document page exactly as written. Preserve formatting and structure."
-    return _extract_text_with_vision(image_base64, prompt)
+    text = _extract_text_with_vision(image_base64, prompt)
+
+    # Cache the result
+    cache_manager.cache_ocr(image_bytes, text)
+
+    return text
 
 
 def _process_page_relaxed(pdf_path: str, pdf_doc: fitz.Document, page_num: int) -> str:
@@ -131,15 +144,26 @@ def _process_page_relaxed(pdf_path: str, pdf_doc: fitz.Document, page_num: int) 
     if not embedded_images:
         return page_text
 
-    # Process each embedded image with Vision API
+    # Process each embedded image with Vision API (with caching)
     image_texts = []
     for image_bytes, img_index in embedded_images:
+        # Check cache first
+        cached_text = cache_manager.get_cached_ocr(image_bytes)
+        if cached_text is not None:
+            if cached_text:
+                image_texts.append(f"[image: {cached_text}]")
+            continue
+
         image_base64 = _image_to_base64(image_bytes)
         prompt = (
             "Extract any text from this image. If it's a diagram or figure, "
             "describe its content and any labels. Be concise."
         )
         image_text = _extract_text_with_vision(image_base64, prompt)
+
+        # Cache the result
+        cache_manager.cache_ocr(image_bytes, image_text)
+
         if image_text:
             image_texts.append(f"[image: {image_text}]")
 
