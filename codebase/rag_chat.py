@@ -4,6 +4,7 @@ from psycopg2 import pool
 from openai import OpenAI
 from dotenv import load_dotenv
 import time
+from reranker import rerank_chunks, RERANK_CANDIDATES, RERANK_TOP_K
 
 # ----------------------------
 # Load environment variables
@@ -71,8 +72,8 @@ def embed_query(query):
 # ----------------------------
 # Retrieve initial pool of chunks from PostgreSQL
 # ----------------------------
-MAX_INITIAL = 15
-MAX_CORPUS_PCT = 0.25
+MAX_INITIAL = RERANK_CANDIDATES  # Fetch more candidates for reranking (default 20)
+MAX_CORPUS_PCT = 0.50  # Increased to allow more candidates for reranking
 
 def get_top_k(raw_query_embedding, user_id):
     # Convert embedding to pgvector format: [0.12,0.53,...]
@@ -168,26 +169,41 @@ def ask(query, user_id):
     query_embedding = embed_query(query)
     print(f"Embedding took: {time.time() - t0:.2f}s")
 
-    # 2. Retrieve initial pool of chunks for this user
+    # 2. Retrieve initial pool of chunks for this user (top RERANK_CANDIDATES)
     t1 = time.time()
     initial_chunks, total_chunks = get_top_k(query_embedding, user_id)
     print(f"DB query took: {time.time() - t1:.2f}s")
 
-    # 3. Filter chunks dynamically
+    # 3. Filter chunks by similarity threshold
     filtered_chunks, low_confidence = filter_chunks(initial_chunks)
+
+    # 4. Rerank filtered chunks using LLM (two-stage retrieval)
+    t2 = time.time()
+    reranked_chunks, rejected = rerank_chunks(query, filtered_chunks, top_k=RERANK_TOP_K)
+    print(f"Reranking took: {time.time() - t2:.2f}s")
+
+    # Use reranked chunks, or fall back to filtered if rejected
+    if rejected or not reranked_chunks:
+        final_chunks = filtered_chunks[:RERANK_TOP_K]
+        rerank_status = "rejected (using vector similarity order)"
+    else:
+        final_chunks = reranked_chunks
+        rerank_status = "applied"
+
     print(f"\n--- Chunk Selection ---")
     print(f"Total corpus: {total_chunks} chunks")
-    print(f"Initial pool: {len(initial_chunks)} chunks")
-    print(f"After filtering: {len(filtered_chunks)} chunks")
+    print(f"Vector search: {len(initial_chunks)} candidates")
+    print(f"After similarity filter: {len(filtered_chunks)} chunks")
+    print(f"After reranking: {len(final_chunks)} chunks ({rerank_status})")
     if low_confidence:
         print("Low confidence match")
     print("------------------------")
 
-    # 4. Format context text and display retrieved chunks
+    # 5. Format context text and display retrieved chunks
     # Chunk tuple format: (chunk, header, source, chunk_index, similarity)
     context_text = ""
-    print("\n--- Retrieved Chunks ---")
-    for i, (chunk, header, source, chunk_index, sim) in enumerate(filtered_chunks):
+    print("\n--- Retrieved Chunks (after reranking) ---")
+    for i, (chunk, header, source, chunk_index, sim) in enumerate(final_chunks):
         # chunk_index is 0-based in DB, display as 1-based
         display_chunk_num = chunk_index + 1
         if header:
@@ -198,7 +214,7 @@ def ask(query, user_id):
             context_text += f"[Chunk {display_chunk_num}] (source: {source})\n{chunk}\n\n"
     print("------------------------\n")
 
-    # 5. Create RAG prompt (with low-confidence preamble if needed)
+    # 6. Create RAG prompt (with low-confidence preamble if needed)
     if low_confidence:
         preamble = """IMPORTANT: The retrieved context has low relevance to the user's question.
 Start your response with: "I couldn't find exactly what you were looking for, but here's something that might be relevant:"
@@ -221,13 +237,13 @@ Question: {query}
 When you reference information from the context, cite it using the chunk number shown (e.g., [Chunk 5], [Chunk 12]).
 """
 
-    # 6. Generate answer using OpenAI
-    t2 = time.time()
+    # 7. Generate answer using OpenAI
+    t3 = time.time()
     response = openai_client.chat.completions.create(
         model="gpt-4o-mini",
         messages=[{"role": "user", "content": prompt}]
     )
-    print(f"LLM generation took: {time.time() - t2:.2f}s")
+    print(f"LLM generation took: {time.time() - t3:.2f}s")
 
     return response.choices[0].message.content
 
