@@ -1,8 +1,10 @@
 import os
+import sys
 import psycopg2
 from openai import OpenAI
 from dotenv import load_dotenv
 from chunk_pdf import chunk_pdf
+from semantic_chunker import chunk_semantically_from_pdf
 import time
 
 # ----------------------------
@@ -87,16 +89,36 @@ def embed_batch(texts):
 # ----------------------------
 # Process PDF: chunk, embed, insert
 # ----------------------------
-def process_pdf(path, user_id):
-    # 1. Chunk the PDF
-    print(f"Chunking {path}...")
-    chunks = chunk_pdf(path)
+def process_pdf(path, user_id, use_semantic=False):
+    """
+    Process a PDF: chunk, embed, and store in database.
+
+    Args:
+        path: Path to PDF file
+        user_id: User ID to associate chunks with
+        use_semantic: If True, use AI-powered semantic chunking with headers
+    """
+    if use_semantic:
+        # Use semantic chunking with headers
+        print(f"Semantic chunking {path}...")
+        chunk_data = chunk_semantically_from_pdf(path)
+        headers = [header for header, _ in chunk_data]
+        chunks = [text for _, text in chunk_data]
+        # Embed header + chunk together for better retrieval
+        texts_to_embed = [f"{header}\n\n{text}" for header, text in chunk_data]
+    else:
+        # Use traditional regex chunking
+        print(f"Chunking {path}...")
+        chunks = chunk_pdf(path)
+        headers = [None] * len(chunks)
+        texts_to_embed = chunks
+
     print(f"Created {len(chunks)} chunks")
 
     # 2. Embed all chunks using OpenAI batch API
     print(f"\nEmbedding {len(chunks)} chunks with OpenAI...")
     t0 = time.time()
-    embeddings = embed_batch(chunks)
+    embeddings = embed_batch(texts_to_embed)
     print(f"Embedding took: {time.time() - t0:.2f}s")
 
     # 3. Insert into database
@@ -104,16 +126,16 @@ def process_pdf(path, user_id):
     conn = connect_db()
     cur = conn.cursor()
 
-    for i, (chunk, embedding) in enumerate(zip(chunks, embeddings)):
+    for i, (chunk, header, embedding) in enumerate(zip(chunks, headers, embeddings)):
         # Convert to pgvector format: [0.1,0.2,0.3,...]
         emb_str = "[" + ",".join(str(x) for x in embedding) + "]"
 
         cur.execute(
             """
-            INSERT INTO chunks (user_id, chunk, embedding, source, chunk_index)
-            VALUES (%s, %s, %s, %s, %s);
+            INSERT INTO chunks (user_id, chunk, header, embedding, source, chunk_index)
+            VALUES (%s, %s, %s, %s, %s, %s);
             """,
-            (user_id, chunk, emb_str, path, i)
+            (user_id, chunk, header, emb_str, path, i)
         )
 
     conn.commit()
@@ -126,4 +148,13 @@ if __name__ == "__main__":
     # Get or create demo user for CLI usage
     demo_user_id = get_or_create_demo_user()
     print(f"Using demo user (id={demo_user_id})")
-    process_pdf(PDF_PATH, demo_user_id)
+
+    # Check for --semantic flag
+    use_semantic = "--semantic" in sys.argv
+
+    if use_semantic:
+        print("Using AI-powered semantic chunking...")
+    else:
+        print("Using traditional regex chunking (use --semantic for AI chunking)")
+
+    process_pdf(PDF_PATH, demo_user_id, use_semantic=use_semantic)
