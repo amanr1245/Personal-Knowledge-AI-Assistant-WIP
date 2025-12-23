@@ -19,6 +19,7 @@ import spacy
 from pydantic import BaseModel
 from openai import OpenAI
 from retry_manager import with_retry
+from pdf_extractor import extract_text_from_pdf
 
 load_dotenv()
 
@@ -307,11 +308,8 @@ def chunk_semantically_from_pdf(pdf_path: str, target_words: int = 500) -> List[
     Returns:
         List of (header, chunk_text) tuples
     """
-    import pdfplumber
-
     print(f"Extracting text from: {pdf_path}")
-    with pdfplumber.open(pdf_path) as pdf:
-        text = " ".join(p.extract_text() or "" for p in pdf.pages)
+    text = extract_text_from_pdf(pdf_path)
 
     return chunk_semantically(text, target_words)
 
