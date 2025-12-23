@@ -1,8 +1,8 @@
 import os
-import pdfplumber
 import re
 from dotenv import load_dotenv
 from ocr_processor import process_pdf_with_ocr_combined, OcrStrategy
+from pdf_extractor import extract_text_from_pdf
 import cache_manager
 
 load_dotenv()
@@ -27,9 +27,8 @@ def chunk_pdf(path, max_len=500, overlap=100, use_ocr=False, ocr_strategy=OcrStr
         # Use OCR processor for text extraction
         text = process_pdf_with_ocr_combined(path, ocr_strategy, ocr_threshold)
     else:
-        # Use pdfplumber for standard text extraction
-        with pdfplumber.open(path) as pdf:
-            text = " ".join(p.extract_text() or "" for p in pdf.pages)
+        # Use PyMuPDF for standard text extraction
+        text = extract_text_from_pdf(path)
 
     # Clean up whitespace
     text = re.sub(r"\s+", " ", text).strip()
