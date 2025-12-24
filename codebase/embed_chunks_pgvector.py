@@ -1,10 +1,12 @@
 import os
 import sys
+import re
 import psycopg2
 from openai import OpenAI
 from dotenv import load_dotenv
 from chunk_pdf import chunk_pdf
-from semantic_chunker import chunk_semantically_from_pdf
+from semantic_chunker import chunk_semantically_from_pdf, chunk_semantically
+from loaders import load_file, SUPPORTED_EXTENSIONS, is_supported
 import cache_manager
 from retry_manager import with_retry
 import time
@@ -114,33 +116,93 @@ def embed_batch(texts):
 
 
 # ----------------------------
-# Process PDF: chunk, embed, insert
+# Chunk text content
 # ----------------------------
-def process_pdf(path, user_id, use_semantic=False):
+def chunk_text(text, max_len=500, overlap=100):
     """
-    Process a PDF: chunk, embed, and store in database.
+    Chunk text into segments using sentence-based splitting.
 
     Args:
-        path: Path to PDF file
+        text: Text content to chunk
+        max_len: Maximum chunk length in characters
+        overlap: Character overlap between chunks
+
+    Returns:
+        List of text chunks
+    """
+    # Clean up whitespace
+    text = re.sub(r"\s+", " ", text).strip()
+
+    # Split into sentences
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    chunks = []
+    current_chunk = ""
+
+    for sentence in sentences:
+        if len(current_chunk) + len(sentence) > max_len and current_chunk:
+            chunks.append(current_chunk.strip())
+            overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+            current_chunk = overlap_text + " " + sentence
+        else:
+            current_chunk += " " + sentence
+
+    if current_chunk.strip():
+        chunks.append(current_chunk.strip())
+
+    return chunks
+
+
+# ----------------------------
+# Process any supported file: load, chunk, embed, insert
+# ----------------------------
+def process_file(path, user_id, use_semantic=False):
+    """
+    Process any supported file: load, chunk, embed, and store in database.
+
+    Args:
+        path: Path to file (PDF, image, text, or document)
         user_id: User ID to associate chunks with
         use_semantic: If True, use AI-powered semantic chunking with headers
     """
-    if use_semantic:
-        # Use semantic chunking with headers
-        print(f"Semantic chunking {path}...")
-        chunk_data = chunk_semantically_from_pdf(path)
-        headers = [header for header, _ in chunk_data]
-        chunks = [text for _, text in chunk_data]
-        # Embed header + chunk together for better retrieval
-        texts_to_embed = [f"{header}\n\n{text}" for header, text in chunk_data]
+    ext = os.path.splitext(path)[1].lower()
+
+    # For PDFs, use existing optimized pipeline
+    if ext == '.pdf':
+        if use_semantic:
+            print(f"Semantic chunking {path}...")
+            chunk_data = chunk_semantically_from_pdf(path)
+            headers = [header for header, _ in chunk_data]
+            chunks = [text for _, text in chunk_data]
+            texts_to_embed = [f"{header}\n\n{text}" for header, text in chunk_data]
+        else:
+            print(f"Chunking {path}...")
+            chunks = chunk_pdf(path)
+            headers = [None] * len(chunks)
+            texts_to_embed = chunks
     else:
-        # Use traditional regex chunking
-        print(f"Chunking {path}...")
-        chunks = chunk_pdf(path)
-        headers = [None] * len(chunks)
-        texts_to_embed = chunks
+        # For all other formats, use unified loader
+        print(f"Loading {path}...")
+        text = load_file(path)
+        print(f"Extracted {len(text)} characters")
+
+        if use_semantic:
+            print(f"Semantic chunking...")
+            chunk_data = chunk_semantically(text)
+            headers = [header for header, _ in chunk_data]
+            chunks = [text for _, text in chunk_data]
+            texts_to_embed = [f"{header}\n\n{text}" for header, text in chunk_data]
+        else:
+            print(f"Chunking...")
+            chunks = chunk_text(text)
+            headers = [None] * len(chunks)
+            texts_to_embed = chunks
 
     print(f"Created {len(chunks)} chunks")
+
+    if len(chunks) == 0:
+        print(f"Warning: No chunks created from {path}")
+        return
 
     # 2. Embed all chunks using OpenAI batch API
     print(f"\nEmbedding {len(chunks)} chunks with OpenAI...")
@@ -159,16 +221,59 @@ def process_pdf(path, user_id, use_semantic=False):
 
         cur.execute(
             """
-            INSERT INTO chunks (user_id, chunk, header, embedding, source, chunk_index)
-            VALUES (%s, %s, %s, %s, %s, %s);
+            INSERT INTO chunks (user_id, chunk, header, embedding, source, chunk_index, file_type)
+            VALUES (%s, %s, %s, %s, %s, %s, %s);
             """,
-            (user_id, chunk, header, emb_str, path, i)
+            (user_id, chunk, header, emb_str, path, i, ext)
         )
 
     conn.commit()
     cur.close()
     conn.close()
     print(f"All {len(chunks)} chunks embedded and stored!")
+
+
+# ----------------------------
+# Process directory: scan and process all supported files
+# ----------------------------
+def process_directory(dir_path, user_id, use_semantic=False):
+    """
+    Scan a directory and process all supported files.
+
+    Args:
+        dir_path: Path to directory
+        user_id: User ID to associate chunks with
+        use_semantic: If True, use AI-powered semantic chunking
+    """
+    if not os.path.isdir(dir_path):
+        raise NotADirectoryError(f"Not a directory: {dir_path}")
+
+    supported_files = []
+
+    for root, dirs, files in os.walk(dir_path):
+        for file in files:
+            file_path = os.path.join(root, file)
+            if is_supported(file_path):
+                supported_files.append(file_path)
+
+    print(f"Found {len(supported_files)} supported files in {dir_path}")
+    print(f"Supported formats: {', '.join(SUPPORTED_EXTENSIONS.keys())}")
+
+    for i, file_path in enumerate(supported_files):
+        print(f"\n[{i+1}/{len(supported_files)}] Processing: {file_path}")
+        try:
+            process_file(file_path, user_id, use_semantic)
+        except Exception as e:
+            print(f"Error processing {file_path}: {e}")
+            continue
+
+    print(f"\nProcessed {len(supported_files)} files")
+
+
+# Legacy alias for backwards compatibility
+def process_pdf(path, user_id, use_semantic=False):
+    """Legacy function - use process_file instead."""
+    return process_file(path, user_id, use_semantic)
 
 
 if __name__ == "__main__":
@@ -191,4 +296,25 @@ if __name__ == "__main__":
     else:
         print("Using traditional regex chunking (use --semantic for AI chunking)")
 
-    process_pdf(PDF_PATH, demo_user_id, use_semantic=use_semantic)
+    # Get path from command line or environment
+    args = [a for a in sys.argv[1:] if not a.startswith('--')]
+    path = args[0] if args else PDF_PATH
+
+    if not path:
+        print("Usage: python embed_chunks_pgvector.py <file_or_directory> [--semantic] [--nocache]")
+        print(f"\nSupported formats: {', '.join(sorted(SUPPORTED_EXTENSIONS.keys()))}")
+        sys.exit(1)
+
+    # Process file or directory
+    if os.path.isdir(path):
+        print(f"\nProcessing directory: {path}")
+        process_directory(path, demo_user_id, use_semantic=use_semantic)
+    elif os.path.isfile(path):
+        if not is_supported(path):
+            print(f"Error: Unsupported file format")
+            print(f"Supported formats: {', '.join(sorted(SUPPORTED_EXTENSIONS.keys()))}")
+            sys.exit(1)
+        process_file(path, demo_user_id, use_semantic=use_semantic)
+    else:
+        print(f"Error: Path not found: {path}")
+        sys.exit(1)
