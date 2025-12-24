@@ -53,7 +53,9 @@ cur.execute("""
         embedding vector(1536),
         source TEXT,
         chunk_index INT,
-        file_type TEXT
+        file_type TEXT,
+        content_hash TEXT,
+        file_mtime TIMESTAMP
     );
 """)
 conn.commit()
@@ -84,6 +86,17 @@ cur.execute("""
 """)
 conn.commit()
 print("User ID index created")
+
+# ----------------------------
+# Create index on source + content_hash for incremental updates
+# ----------------------------
+print("Creating index on source and content_hash...")
+cur.execute("""
+    CREATE INDEX IF NOT EXISTS chunks_source_hash_idx
+    ON chunks (source, content_hash);
+""")
+conn.commit()
+print("Source/hash index created")
 
 print("\nAll tables and indexes ready!")
 

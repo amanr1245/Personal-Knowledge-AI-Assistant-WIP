@@ -1,6 +1,7 @@
 import os
 import sys
 import re
+from datetime import datetime
 import psycopg2
 from openai import OpenAI
 from dotenv import load_dotenv
@@ -8,6 +9,13 @@ from chunk_pdf import chunk_pdf
 from semantic_chunker import chunk_semantically_from_pdf, chunk_semantically
 from loaders import load_file, SUPPORTED_EXTENSIONS, is_supported
 from processors import EmbedProcessor
+from file_tracker import (
+    compute_file_hash,
+    scan_directory,
+    categorize_files,
+    get_files_to_process,
+    print_file_status_summary
+)
 import cache_manager
 from retry_manager import with_retry
 import time
@@ -71,6 +79,65 @@ def get_or_create_demo_user():
     cur.close()
     conn.close()
     return user_id
+
+
+# ----------------------------
+# Get existing file hashes from database
+# ----------------------------
+def get_existing_files(user_id: int) -> dict:
+    """
+    Get existing file hashes from database for a user.
+
+    Args:
+        user_id: User ID to query
+
+    Returns:
+        Dict mapping source path -> content_hash
+    """
+    conn = connect_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        SELECT DISTINCT source, content_hash
+        FROM chunks
+        WHERE user_id = %s AND content_hash IS NOT NULL;
+    """, (user_id,))
+
+    result = {row[0]: row[1] for row in cur.fetchall()}
+
+    cur.close()
+    conn.close()
+    return result
+
+
+# ----------------------------
+# Delete chunks by source file
+# ----------------------------
+def delete_chunks_by_source(source: str, user_id: int) -> int:
+    """
+    Delete all chunks for a source file.
+
+    Args:
+        source: Source file path
+        user_id: User ID
+
+    Returns:
+        Number of chunks deleted
+    """
+    conn = connect_db()
+    cur = conn.cursor()
+
+    cur.execute("""
+        DELETE FROM chunks
+        WHERE source = %s AND user_id = %s;
+    """, (source, user_id))
+
+    deleted = cur.rowcount
+    conn.commit()
+    cur.close()
+    conn.close()
+
+    return deleted
 
 
 # ----------------------------
@@ -194,7 +261,7 @@ def chunk_text(text, max_len=500, overlap=100):
 # ----------------------------
 # Process any supported file: load, chunk, embed, insert
 # ----------------------------
-def process_file(path, user_id, use_semantic=False):
+def process_file(path, user_id, use_semantic=False, content_hash=None):
     """
     Process any supported file: load, chunk, embed, and store in database.
 
@@ -202,8 +269,16 @@ def process_file(path, user_id, use_semantic=False):
         path: Path to file (PDF, image, text, or document)
         user_id: User ID to associate chunks with
         use_semantic: If True, use AI-powered semantic chunking with headers
+        content_hash: Pre-computed content hash (computed if None)
     """
     ext = os.path.splitext(path)[1].lower()
+
+    # Compute content hash if not provided
+    if content_hash is None:
+        content_hash = compute_file_hash(path)
+
+    # Get file modification time
+    file_mtime = datetime.fromtimestamp(os.path.getmtime(path))
 
     # For PDFs, use existing optimized pipeline
     if ext == '.pdf':
@@ -259,10 +334,10 @@ def process_file(path, user_id, use_semantic=False):
 
         cur.execute(
             """
-            INSERT INTO chunks (user_id, chunk, header, embedding, source, chunk_index, file_type)
-            VALUES (%s, %s, %s, %s, %s, %s, %s);
+            INSERT INTO chunks (user_id, chunk, header, embedding, source, chunk_index, file_type, content_hash, file_mtime)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
             """,
-            (user_id, chunk, header, emb_str, path, i, ext)
+            (user_id, chunk, header, emb_str, path, i, ext, content_hash, file_mtime)
         )
 
     conn.commit()
@@ -308,6 +383,83 @@ def process_directory(dir_path, user_id, use_semantic=False):
     print(f"\nProcessed {len(supported_files)} files")
 
 
+# ----------------------------
+# Process directory incrementally: only new/modified files
+# ----------------------------
+def process_directory_incremental(dir_path, user_id, use_semantic=False):
+    """
+    Scan a directory and process only new or modified files.
+
+    - Skips unchanged files
+    - Re-processes modified files (deletes old chunks first)
+    - Deletes chunks for removed files
+
+    Args:
+        dir_path: Path to directory
+        user_id: User ID to associate chunks with
+        use_semantic: If True, use AI-powered semantic chunking
+    """
+    if not os.path.isdir(dir_path):
+        raise NotADirectoryError(f"Not a directory: {dir_path}")
+
+    print(f"\n{'='*60}")
+    print(f"INCREMENTAL UPDATE: {dir_path}")
+    print(f"{'='*60}")
+
+    # Get existing files from database
+    existing_files = get_existing_files(user_id)
+    print(f"Found {len(existing_files)} existing files in database")
+
+    # Scan current files on disk
+    extensions = set(SUPPORTED_EXTENSIONS.keys())
+    current_files = scan_directory(dir_path, extensions)
+    print(f"Found {len(current_files)} supported files on disk")
+
+    # Categorize files
+    categorized = categorize_files(current_files, existing_files)
+    print_file_status_summary(categorized)
+
+    # Get files to process and delete
+    to_process, to_delete, to_delete_first = get_files_to_process(current_files, existing_files)
+
+    # Phase 1: Delete chunks for removed files
+    if to_delete:
+        print(f"\n--- Deleting chunks for {len(to_delete)} removed files ---")
+        for path in to_delete:
+            deleted = delete_chunks_by_source(path, user_id)
+            print(f"  Deleted {deleted} chunks: {path}")
+
+    # Phase 2: Delete chunks for modified files (before re-processing)
+    if to_delete_first:
+        print(f"\n--- Deleting old chunks for {len(to_delete_first)} modified files ---")
+        for path in to_delete_first:
+            deleted = delete_chunks_by_source(path, user_id)
+            print(f"  Deleted {deleted} chunks: {path}")
+
+    # Phase 3: Process new and modified files
+    if to_process:
+        print(f"\n--- Processing {len(to_process)} files ---")
+        for i, file_path in enumerate(to_process):
+            print(f"\n[{i+1}/{len(to_process)}] Processing: {file_path}")
+            try:
+                # Compute hash for storage
+                content_hash = compute_file_hash(file_path)
+                process_file(file_path, user_id, use_semantic, content_hash=content_hash)
+            except Exception as e:
+                print(f"Error processing {file_path}: {e}")
+                continue
+    else:
+        print("\nNo files need processing - everything is up to date!")
+
+    # Summary
+    print(f"\n{'='*60}")
+    print(f"INCREMENTAL UPDATE COMPLETE")
+    print(f"  Files processed: {len(to_process)}")
+    print(f"  Files deleted: {len(to_delete)}")
+    print(f"  Files unchanged: {len(categorized['unchanged'])}")
+    print(f"{'='*60}")
+
+
 # Legacy alias for backwards compatibility
 def process_pdf(path, user_id, use_semantic=False):
     """Legacy function - use process_file instead."""
@@ -334,19 +486,32 @@ if __name__ == "__main__":
     else:
         print("Using traditional regex chunking (use --semantic for AI chunking)")
 
+    # Check for --update flag (incremental mode)
+    incremental_mode = "--update" in sys.argv
+
+    if incremental_mode:
+        print("Incremental update mode enabled (only process new/modified files)")
+
     # Get path from command line or environment
     args = [a for a in sys.argv[1:] if not a.startswith('--')]
     path = args[0] if args else PDF_PATH
 
     if not path:
-        print("Usage: python embed_chunks_pgvector.py <file_or_directory> [--semantic] [--nocache]")
+        print("Usage: python embed_chunks_pgvector.py <file_or_directory> [options]")
+        print("\nOptions:")
+        print("  --semantic   Use AI-powered semantic chunking")
+        print("  --update     Incremental mode: only process new/modified files")
+        print("  --nocache    Disable embedding cache")
         print(f"\nSupported formats: {', '.join(sorted(SUPPORTED_EXTENSIONS.keys()))}")
         sys.exit(1)
 
     # Process file or directory
     if os.path.isdir(path):
         print(f"\nProcessing directory: {path}")
-        process_directory(path, demo_user_id, use_semantic=use_semantic)
+        if incremental_mode:
+            process_directory_incremental(path, demo_user_id, use_semantic=use_semantic)
+        else:
+            process_directory(path, demo_user_id, use_semantic=use_semantic)
     elif os.path.isfile(path):
         if not is_supported(path):
             print(f"Error: Unsupported file format")
