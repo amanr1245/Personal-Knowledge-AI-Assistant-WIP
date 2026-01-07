@@ -28,7 +28,15 @@ load_dotenv()
 # ----------------------------
 # OpenAI client
 # ----------------------------
-openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+# Validate OPENAI_API_KEY is present
+openai_api_key = os.getenv("OPENAI_API_KEY")
+if not openai_api_key:
+    raise ValueError(
+        "OPENAI_API_KEY environment variable is required but not set. "
+        "Please set it in your .env file or environment."
+    )
+
+openai_client = OpenAI(api_key=openai_api_key)
 
 PDF_PATH = os.getenv("PDF_PATH")
 BATCH_SIZE = 2048  # OpenAI allows up to 2048 embeddings per request
@@ -43,12 +51,22 @@ PARALLEL_BATCH_SIZE = int(os.getenv("EMBED_BATCH_SIZE", "100"))
 # Connect to PostgreSQL
 # ----------------------------
 def connect_db():
+    """
+    Connect to PostgreSQL using environment variables.
+
+    Environment variables:
+    - DB_NAME: Database name (default: personal_rag)
+    - DB_USER: Database user (default: postgres)
+    - DB_PASSWORD: Database password (default: postgres)
+    - DB_HOST: Database host (default: localhost)
+    - DB_PORT: Database port (default: 5432)
+    """
     return psycopg2.connect(
-        dbname="personal_rag",
-        user="postgres",
-        password="postgres",
-        host="localhost",
-        port=5432
+        dbname=os.getenv("DB_NAME", "personal_rag"),
+        user=os.getenv("DB_USER", "postgres"),
+        password=os.getenv("DB_PASSWORD", "postgres"),
+        host=os.getenv("DB_HOST", "localhost"),
+        port=int(os.getenv("DB_PORT", "5432"))
     )
 
 
@@ -56,29 +74,38 @@ def connect_db():
 # Get or create demo user
 # ----------------------------
 def get_or_create_demo_user():
-    """Get the demo user's ID, creating the user if needed."""
+    """
+    Get the demo user's ID, creating the user if needed.
+
+    Uses upsert pattern to avoid race conditions between SELECT and INSERT.
+    Requires unique constraint on users.api_key column.
+    """
     conn = connect_db()
     cur = conn.cursor()
 
-    # Try to get existing demo user
-    cur.execute("SELECT id FROM users WHERE api_key = 'demo-api-key';")
-    result = cur.fetchone()
-
-    if result:
-        user_id = result[0]
-    else:
-        # Create demo user if not exists
+    try:
+        # Try to insert, ignore if exists (requires unique constraint on api_key)
         cur.execute("""
             INSERT INTO users (name, api_key)
             VALUES ('Demo User', 'demo-api-key')
+            ON CONFLICT (api_key) DO NOTHING
             RETURNING id;
         """)
-        user_id = cur.fetchone()[0]
-        conn.commit()
+        result = cur.fetchone()
 
-    cur.close()
-    conn.close()
-    return user_id
+        if result:
+            # Successfully inserted new user
+            user_id = result[0]
+            conn.commit()
+        else:
+            # Conflict occurred (user already exists), fetch existing id
+            cur.execute("SELECT id FROM users WHERE api_key = 'demo-api-key';")
+            user_id = cur.fetchone()[0]
+
+        return user_id
+    finally:
+        cur.close()
+        conn.close()
 
 
 # ----------------------------
@@ -94,20 +121,26 @@ def get_existing_files(user_id: int) -> dict:
     Returns:
         Dict mapping source path -> content_hash
     """
-    conn = connect_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
 
-    cur.execute("""
-        SELECT DISTINCT source, content_hash
-        FROM chunks
-        WHERE user_id = %s AND content_hash IS NOT NULL;
-    """, (user_id,))
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
 
-    result = {row[0]: row[1] for row in cur.fetchall()}
+        cur.execute("""
+            SELECT DISTINCT source, content_hash
+            FROM chunks
+            WHERE user_id = %s AND content_hash IS NOT NULL;
+        """, (user_id,))
 
-    cur.close()
-    conn.close()
-    return result
+        result = {row[0]: row[1] for row in cur.fetchall()}
+        return result
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
 
 
 # ----------------------------
@@ -124,20 +157,31 @@ def delete_chunks_by_source(source: str, user_id: int) -> int:
     Returns:
         Number of chunks deleted
     """
-    conn = connect_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
 
-    cur.execute("""
-        DELETE FROM chunks
-        WHERE source = %s AND user_id = %s;
-    """, (source, user_id))
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
 
-    deleted = cur.rowcount
-    conn.commit()
-    cur.close()
-    conn.close()
+        cur.execute("""
+            DELETE FROM chunks
+            WHERE source = %s AND user_id = %s;
+        """, (source, user_id))
 
-    return deleted
+        deleted = cur.rowcount
+        conn.commit()
+
+        return deleted
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
 
 
 # ----------------------------
@@ -208,7 +252,26 @@ def embed_batch_sequential(texts):
             )
 
             embeddings = [item.embedding for item in response.data]
+
+            # Validate embedding count matches batch size
+            if len(embeddings) != len(batch):
+                error_msg = (
+                    f"Embedding count mismatch: expected {len(batch)} embeddings, "
+                    f"but received {len(embeddings)} from API"
+                )
+                print(f"ERROR: {error_msg}")
+                raise ValueError(error_msg)
+
             new_embeddings.extend(embeddings)
+
+        # Validate total embeddings match texts to embed
+        if len(new_embeddings) != len(texts_to_embed):
+            error_msg = (
+                f"Total embedding count mismatch: expected {len(texts_to_embed)} embeddings, "
+                f"but got {len(new_embeddings)} after processing all batches"
+            )
+            print(f"ERROR: {error_msg}")
+            raise ValueError(error_msg)
 
         # Cache new embeddings and add to results
         for idx, (text, embedding) in enumerate(zip(texts_to_embed, new_embeddings)):
@@ -270,6 +333,9 @@ def process_file(path, user_id, use_semantic=False, content_hash=None):
         user_id: User ID to associate chunks with
         use_semantic: If True, use AI-powered semantic chunking with headers
         content_hash: Pre-computed content hash (computed if None)
+
+    Returns:
+        int: Number of chunks created and stored
     """
     ext = os.path.splitext(path)[1].lower()
 
@@ -315,7 +381,7 @@ def process_file(path, user_id, use_semantic=False, content_hash=None):
 
     if len(chunks) == 0:
         print(f"Warning: No chunks created from {path}")
-        return
+        return 0
 
     # 2. Embed all chunks using OpenAI batch API
     print(f"\nEmbedding {len(chunks)} chunks with OpenAI...")
@@ -325,25 +391,63 @@ def process_file(path, user_id, use_semantic=False, content_hash=None):
 
     # 3. Insert into database
     print(f"\nInserting into database for user_id={user_id}...")
-    conn = connect_db()
-    cur = conn.cursor()
+    conn = None
+    cur = None
 
-    for i, (chunk, header, embedding) in enumerate(zip(chunks, headers, embeddings)):
-        # Convert to pgvector format: [0.1,0.2,0.3,...]
-        emb_str = "[" + ",".join(str(x) for x in embedding) + "]"
+    try:
+        conn = connect_db()
+        cur = conn.cursor()
 
-        cur.execute(
+        # Prepare batch data for executemany()
+        batch_data = []
+        for i, (chunk, header, embedding) in enumerate(zip(chunks, headers, embeddings)):
+            # Convert to pgvector format: [0.1,0.2,0.3,...]
+            emb_str = "[" + ",".join(str(x) for x in embedding) + "]"
+            batch_data.append((user_id, chunk, header, emb_str, path, i, ext, content_hash, file_mtime))
+
+        # Use executemany for efficient batch insert
+        cur.executemany(
             """
             INSERT INTO chunks (user_id, chunk, header, embedding, source, chunk_index, file_type, content_hash, file_mtime)
             VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s);
             """,
-            (user_id, chunk, header, emb_str, path, i, ext, content_hash, file_mtime)
+            batch_data
         )
 
-    conn.commit()
-    cur.close()
-    conn.close()
-    print(f"All {len(chunks)} chunks embedded and stored!")
+        conn.commit()
+        print(f"All {len(chunks)} chunks embedded and stored!")
+        return len(chunks)
+    except Exception:
+        if conn is not None:
+            conn.rollback()
+        raise
+    finally:
+        if cur is not None:
+            cur.close()
+        if conn is not None:
+            conn.close()
+
+
+# ----------------------------
+# Print processing summary with error details
+# ----------------------------
+def print_processing_summary(results: dict):
+    """
+    Print a summary of processing results with error details.
+
+    Args:
+        results: Dict with 'success' and 'failed' lists
+    """
+    print(f"\n{'='*60}")
+    print(f"PROCESSING COMPLETE")
+    print(f"  Success: {len(results['success'])} files")
+    print(f"  Failed:  {len(results['failed'])} files")
+
+    if results['failed']:
+        print(f"\nFailed files:")
+        for path, error in results['failed']:
+            print(f"  - {os.path.basename(path)}: {error}")
+    print(f"{'='*60}")
 
 
 # ----------------------------
@@ -361,6 +465,9 @@ def process_directory(dir_path, user_id, use_semantic=False):
     if not os.path.isdir(dir_path):
         raise NotADirectoryError(f"Not a directory: {dir_path}")
 
+    # Track results
+    results = {'success': [], 'failed': []}
+
     supported_files = []
 
     for root, dirs, files in os.walk(dir_path):
@@ -376,11 +483,14 @@ def process_directory(dir_path, user_id, use_semantic=False):
         print(f"\n[{i+1}/{len(supported_files)}] Processing: {file_path}")
         try:
             process_file(file_path, user_id, use_semantic)
+            results['success'].append(file_path)
         except Exception as e:
-            print(f"Error processing {file_path}: {e}")
+            error_msg = f"{type(e).__name__}: {str(e)}"
+            print(f"ERROR: {error_msg}")
+            results['failed'].append((file_path, error_msg))
             continue
 
-    print(f"\nProcessed {len(supported_files)} files")
+    print_processing_summary(results)
 
 
 # ----------------------------
@@ -429,34 +539,82 @@ def process_directory_incremental(dir_path, user_id, use_semantic=False):
             deleted = delete_chunks_by_source(path, user_id)
             print(f"  Deleted {deleted} chunks: {path}")
 
-    # Phase 2: Delete chunks for modified files (before re-processing)
-    if to_delete_first:
-        print(f"\n--- Deleting old chunks for {len(to_delete_first)} modified files ---")
-        for path in to_delete_first:
-            deleted = delete_chunks_by_source(path, user_id)
-            print(f"  Deleted {deleted} chunks: {path}")
+    # Track results
+    results = {'success': [], 'failed': [], 'modified': []}
 
-    # Phase 3: Process new and modified files
+    # Convert to_delete_first to set for quick lookup
+    modified_files = set(to_delete_first)
+
+    # Phase 2: Process new and modified files (delete old chunks AFTER successful processing)
     if to_process:
         print(f"\n--- Processing {len(to_process)} files ---")
         for i, file_path in enumerate(to_process):
             print(f"\n[{i+1}/{len(to_process)}] Processing: {file_path}")
+            is_modified = file_path in modified_files
+
             try:
                 # Compute hash for storage
                 content_hash = compute_file_hash(file_path)
+
+                # Process the file first (inserts new chunks)
                 process_file(file_path, user_id, use_semantic, content_hash=content_hash)
+
+                # Only delete old chunks AFTER successful processing
+                if is_modified:
+                    # Delete old chunks (those with different content_hash)
+                    # This is safe because new chunks are already inserted
+                    conn = None
+                    cur = None
+                    try:
+                        conn = connect_db()
+                        cur = conn.cursor()
+                        cur.execute(
+                            """
+                            DELETE FROM chunks
+                            WHERE user_id = %s AND source = %s AND content_hash != %s
+                            """,
+                            (user_id, file_path, content_hash)
+                        )
+                        deleted_count = cur.rowcount
+                        conn.commit()
+                        print(f"  Updated existing file (removed {deleted_count} old chunks)")
+                    finally:
+                        if cur is not None:
+                            cur.close()
+                        if conn is not None:
+                            conn.close()
+
+                    results['modified'].append(file_path)
+                else:
+                    print(f"  Added new file")
+
+                results['success'].append(file_path)
+
             except Exception as e:
-                print(f"Error processing {file_path}: {e}")
+                error_msg = f"{type(e).__name__}: {str(e)}"
+                print(f"ERROR: {error_msg}")
+                results['failed'].append((file_path, error_msg))
+                # If processing failed, old chunks are preserved (not deleted)
+                if is_modified:
+                    print(f"  Kept old chunks due to processing failure")
                 continue
     else:
         print("\nNo files need processing - everything is up to date!")
 
     # Summary
+    new_files = len(results['success']) - len(results['modified'])
     print(f"\n{'='*60}")
     print(f"INCREMENTAL UPDATE COMPLETE")
-    print(f"  Files processed: {len(to_process)}")
-    print(f"  Files deleted: {len(to_delete)}")
-    print(f"  Files unchanged: {len(categorized['unchanged'])}")
+    print(f"  New:      {new_files} files")
+    print(f"  Modified: {len(results['modified'])} files")
+    print(f"  Failed:   {len(results['failed'])} files")
+    print(f"  Deleted:  {len(to_delete)} files")
+    print(f"  Unchanged: {len(categorized['unchanged'])} files")
+
+    if results['failed']:
+        print(f"\nFailed files:")
+        for path, error in results['failed']:
+            print(f"  - {os.path.basename(path)}: {error}")
     print(f"{'='*60}")
 
 
