@@ -1,5 +1,6 @@
 import os
 import re
+import hashlib
 from dotenv import load_dotenv
 from ocr_processor import process_pdf_with_ocr_combined, OcrStrategy
 from pdf_extractor import extract_text_from_pdf
@@ -34,7 +35,11 @@ def chunk_pdf(path, max_len=500, overlap=100, use_ocr=False, ocr_strategy=OcrStr
     text = re.sub(r"\s+", " ", text).strip()
 
     # Check cache for chunks (by document text hash + params)
-    cache_content = f"{text}|{max_len}|{overlap}"
+    text_hash = hashlib.sha256(text.encode("utf-8")).hexdigest()
+    if use_ocr:
+        cache_content = f"{text_hash}|{max_len}|{overlap}|ocr|{ocr_strategy}|{ocr_threshold}"
+    else:
+        cache_content = f"{text_hash}|{max_len}|{overlap}|no_ocr"
     cached_chunks = cache_manager.get_cached_chunks(cache_content)
     if cached_chunks is not None:
         print(f"Cache hit: {len(cached_chunks)} chunks from cache")
@@ -47,14 +52,98 @@ def chunk_pdf(path, max_len=500, overlap=100, use_ocr=False, ocr_strategy=OcrStr
     current_chunk = ""
 
     for sentence in sentences:
-        # If adding this sentence exceeds max_len, save current chunk
-        if len(current_chunk) + len(sentence) > max_len and current_chunk:
+        # Handle overly long sentences by splitting into smaller segments
+        if len(sentence) > max_len:
+            words = sentence.split()
+            segment = ""
+
+            for word in words:
+                # Handle extremely long words by splitting them
+                if len(word) > max_len:
+                    # Process current segment first if exists
+                    if segment:
+                        if len(current_chunk) + len(segment) + 1 > max_len and current_chunk:
+                            chunks.append(current_chunk.strip())
+                            overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                            available_space = max_len - len(segment) - 1
+                            if available_space <= 0:
+                                current_chunk = segment[:max_len].strip()
+                            elif len(overlap_text) > available_space:
+                                overlap_text = overlap_text[-available_space:]
+                                current_chunk = (overlap_text + " " + segment).strip()
+                            else:
+                                current_chunk = (overlap_text + " " + segment).strip()
+                        else:
+                            current_chunk = (current_chunk + " " + segment).strip()
+                        segment = ""
+
+                    # Split the long word into max_len chunks
+                    for i in range(0, len(word), max_len):
+                        word_chunk = word[i:i+max_len]
+                        if len(current_chunk) + len(word_chunk) + 1 > max_len and current_chunk:
+                            chunks.append(current_chunk.strip())
+                            overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+                            available_space = max_len - len(word_chunk) - 1
+                            if available_space <= 0:
+                                current_chunk = word_chunk.strip()
+                            elif len(overlap_text) > available_space:
+                                overlap_text = overlap_text[-available_space:]
+                                current_chunk = (overlap_text + " " + word_chunk).strip()
+                            else:
+                                current_chunk = (overlap_text + " " + word_chunk).strip()
+                        else:
+                            current_chunk = (current_chunk + " " + word_chunk).strip()
+                    continue
+
+                # Check if adding this word would exceed max_len
+                test_segment = (segment + " " + word).strip() if segment else word
+
+                if len(test_segment) > max_len and segment:
+                    # Process the current segment as a complete unit
+                    if len(current_chunk) + len(segment) + 1 > max_len and current_chunk:
+                        chunks.append(current_chunk.strip())
+                        overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
+
+                        # Ensure overlap + segment doesn't exceed max_len
+                        available_space = max_len - len(segment) - 1
+                        if available_space <= 0:
+                            # Segment itself exceeds or equals max_len, use no overlap
+                            current_chunk = segment[:max_len].strip()
+                        elif len(overlap_text) > available_space:
+                            # Trim overlap from the start to fit
+                            overlap_text = overlap_text[-available_space:]
+                            current_chunk = (overlap_text + " " + segment).strip()
+                        else:
+                            current_chunk = (overlap_text + " " + segment).strip()
+                    else:
+                        current_chunk = (current_chunk + " " + segment).strip()
+
+                    segment = word
+                else:
+                    segment = test_segment
+
+            # Process remaining segment as the sentence
+            sentence = segment
+
+        # Normal sentence processing
+        if len(current_chunk) + len(sentence) + 1 > max_len and current_chunk:
             chunks.append(current_chunk.strip())
             # Start new chunk with overlap from previous
             overlap_text = current_chunk[-overlap:] if len(current_chunk) > overlap else current_chunk
-            current_chunk = overlap_text + " " + sentence
+
+            # Ensure overlap + sentence doesn't exceed max_len
+            available_space = max_len - len(sentence) - 1
+            if available_space <= 0:
+                # Sentence itself exceeds or equals max_len, use no overlap
+                current_chunk = sentence[:max_len].strip()
+            elif len(overlap_text) > available_space:
+                # Trim overlap from the start to fit
+                overlap_text = overlap_text[-available_space:]
+                current_chunk = (overlap_text + " " + sentence).strip()
+            else:
+                current_chunk = (overlap_text + " " + sentence).strip()
         else:
-            current_chunk += " " + sentence
+            current_chunk = (current_chunk + " " + sentence).strip()
 
     # Don't forget the last chunk
     if current_chunk.strip():
@@ -70,6 +159,11 @@ if __name__ == "__main__":
     import sys
 
     pdf_path = os.getenv("PDF_PATH")
+    if not pdf_path:
+        print("ERROR: PDF_PATH environment variable is required")
+        print("Usage: Set PDF_PATH in .env or run with: PDF_PATH=/path/to/file.pdf python chunk_pdf.py")
+        sys.exit(1)
+
     use_ocr = "--ocr" in sys.argv
 
     if use_ocr:
